@@ -12,6 +12,7 @@
 
 2) get rdesktop out-of-process virtual channel patch (oop.patch)
    http://sf.net/tracker/index.php?func=detail&aid=1472969&group_id=24366&atid=381349
+   (see in /rdecktop_patch)
 
 3) apply rdesktop patch
 
