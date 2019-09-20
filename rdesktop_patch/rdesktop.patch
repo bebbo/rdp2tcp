@@ -1,0 +1,162 @@
+diff -Naur orig/channels.c mod/channels.c
+--- orig/channels.c	2006-04-19 00:46:47.186614784 +0100
++++ mod/channels.c	2006-04-19 00:18:24.674435976 +0100
+@@ -179,3 +179,42 @@
+ 		}
+ 	}
+ }
++
++void 
++init_external_vchannel(char * shared_object, char * args, THIRDPARTY_VC * thirdparty_vc)
++{
++	void (*vc_init_func)(void *, void *, void *, char *);
++
++	/* Open the shared library and store the handle */
++	thirdparty_vc->dlhandle = dlopen(shared_object, RTLD_LAZY);
++	if (thirdparty_vc->dlhandle == NULL)
++	{
++		error("%s\n", dlerror());
++		return;
++	}
++
++	/* Find the function called rdesktop_init */
++	vc_init_func = (void *)dlsym(thirdparty_vc->dlhandle, "rdesktop_init");
++	if (vc_init_func == NULL)
++	{
++		error("%s\n", dlerror());
++		dlclose(thirdparty_vc->dlhandle);
++		thirdparty_vc->dlhandle = NULL;
++		return;
++	}
++
++	/* Find the function called rdesktop_cleanup and store the address for use later */
++	thirdparty_vc->vc_cleanup_func = (void *)dlsym(thirdparty_vc->dlhandle, "rdesktop_cleanup");
++	if (thirdparty_vc->vc_cleanup_func == NULL)
++	{
++		error("%s\n", dlerror());
++		dlclose(thirdparty_vc->dlhandle);
++		thirdparty_vc->dlhandle = NULL;
++		return;
++	}
++
++	/* Call the initializer */
++	(*vc_init_func)(channel_register, channel_init, channel_send, args);
++
++	return;
++}
+diff -Naur orig/proto.h mod/proto.h
+--- orig/proto.h	2006-04-19 00:46:47.186614784 +0100
++++ mod/proto.h	2006-04-19 00:16:50.812705128 +0100
+@@ -302,6 +302,9 @@
+ unsigned int seamless_send_zchange(unsigned long id, unsigned long below, unsigned long flags);
+ unsigned int seamless_send_focus(unsigned long id, unsigned long flags);
+ 
++/* External virtual channels */
++void init_external_vchannel(char * shared_object, char * args, THIRDPARTY_VC * thirdparty_vc);
++
+ /* *INDENT-OFF* */
+ #ifdef __cplusplus
+ }
+diff -Naur orig/rdesktop.c mod/rdesktop.c
+--- orig/rdesktop.c	2006-04-19 00:46:47.186614784 +0100
++++ mod/rdesktop.c	2006-04-19 00:55:09.644229616 +0100
+@@ -188,6 +188,7 @@
+ 		"                      'PRIMARYCLIPBOARD' looks at both PRIMARY and CLIPBOARD\n");
+ 	fprintf(stderr, "                      when sending data to server.\n");
+ 	fprintf(stderr, "                      'CLIPBOARD' looks at only CLIPBOARD.\n");
++	fprintf(stderr, "         '-r [shared object]:[args] enable external virtual channel application\n");
+ 	fprintf(stderr, "   -0: attach to console\n");
+ 	fprintf(stderr, "   -4: use RDP version 4\n");
+ 	fprintf(stderr, "   -5: use RDP version 5 (default)\n");
+@@ -403,6 +404,9 @@
+ 	BOOL geometry_option = False;
+ 	int run_count = 0;	/* Session Directory support */
+ 	BOOL continue_connect = True;	/* Session Directory support */
++	THIRDPARTY_VC thirdparty_vc[MAX_THIRDPARTY_VCS];
++	char soname[1024];
++	int thirdparty_vc_count = 0;
+ 
+ #ifdef HAVE_LOCALE_H
+ 	/* Set locale according to environment */
+@@ -648,8 +652,32 @@
+ 				break;
+ 
+ 			case 'r':
++				strcpy(soname, optarg);
++				p = strchr(soname, ':');
++				if (p != NULL)
++				{
++					*p = '\0';
++				}
++				if (strcmp(".so", soname + strlen(soname) - 3) == 0)
++				{
++					if (thirdparty_vc_count >= MAX_THIRDPARTY_VCS)
++					{
++						error("Third party channel table full, increase MAX_THIRDPARTY_VCS\n");
++						return 1;
++					}
+ 
+-				if (str_startswith(optarg, "sound"))
++					init_external_vchannel(optarg, next_arg(optarg, ':'), &thirdparty_vc[thirdparty_vc_count]);
++					if (thirdparty_vc[thirdparty_vc_count].dlhandle != NULL)
++					{
++						thirdparty_vc_count++;
++					}
++					else
++					{
++						error("Failed to initialise third party virtual channel [%s]\n", optarg);
++						return 1;
++					}
++				}
++				else if (str_startswith(optarg, "sound"))
+ 				{
+ 					optarg += 5;
+ 
+@@ -940,6 +968,13 @@
+ 	cache_save_state();
+ 	ui_deinit();
+ 
++	/* Call all open shared objects' cleanup routines then close them */
++	for (c = 0; c < thirdparty_vc_count; c++)
++	{
++		(*(thirdparty_vc[c].vc_cleanup_func))();
++		dlclose(thirdparty_vc[c].dlhandle);
++	}
++
+ 	if (ext_disc_reason >= 2)
+ 		print_disconnect_reason(ext_disc_reason);
+ 
+diff -Naur orig/rdesktop.h mod/rdesktop.h
+--- orig/rdesktop.h	2006-04-19 00:46:47.186614784 +0100
++++ mod/rdesktop.h	2006-04-19 00:44:39.504025488 +0100
+@@ -23,6 +23,7 @@
+ #include <string.h>
+ #include <dirent.h>
+ #include <sys/time.h>
++#include <dlfcn.h>
+ #ifdef HAVE_SYS_SELECT_H
+ #include <sys/select.h>
+ #else
+@@ -33,6 +34,9 @@
+ 
+ #define VERSION "1.4.1"
+ 
++/* Maximum no of third party virtual channel shared libs */
++#define MAX_THIRDPARTY_VCS 20
++
+ #ifdef WITH_DEBUG
+ #define DEBUG(args)	printf args;
+ #else
+diff -Naur orig/types.h mod/types.h
+--- orig/types.h	2006-04-19 00:46:47.186614784 +0100
++++ mod/types.h	2006-04-19 00:14:38.997744048 +0100
+@@ -266,3 +266,9 @@
+ FILEINFO;
+ 
+ typedef BOOL(*str_handle_lines_t) (const char *line, void *data);
++
++typedef struct _THIRDPARTY_VC
++{
++	void * dlhandle;
++	void (*vc_cleanup_func)(void);
++} THIRDPARTY_VC;
